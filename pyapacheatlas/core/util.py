@@ -8,8 +8,20 @@ import requests
 
 
 class AtlasBaseClient():
-    def __init__(self):
+    def __init__(self, **kwargs):
+        if "requests_args" in kwargs:
+            self._requests_args = kwargs["requests_args"]
+        else:
+            self._requests_args = {}
         super().__init__()
+    
+    @staticmethod
+    def _parse_requests_args(**kwargs):
+        output = dict()
+        keys = [k for k in kwargs.keys() if k.startswith("requests_")]
+        for k in keys:
+            output[k.split("_", 1)[1]] = kwargs.pop(k)
+        return output
 
     def _handle_response(self, resp):
         """
@@ -349,3 +361,25 @@ def batch_dependent_entities(entities, batch_size=1000):
         output_batches.append(sub_output_batch)
 
     return output_batches
+
+def _handle_response(resp):
+    """
+    Safely handle an Atlas Response and return the results if valid.
+
+    :param Response resp: The response from the request method.
+    :return: A dict containing the results.
+    :rtype: dict
+    """
+
+    try:
+        results = json.loads(resp.text)
+        resp.raise_for_status()
+    except JSONDecodeError:
+        raise ValueError("Error in parsing: {}".format(resp.text))
+    except requests.RequestException as e:
+        if "errorCode" in results:
+            raise AtlasException(resp.text)
+        else:
+            raise requests.RequestException(resp.text)
+
+    return results

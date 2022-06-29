@@ -1,11 +1,11 @@
-from .util import AtlasException, AtlasBaseClient, batch_dependent_entities, PurviewLimitation, PurviewOnly
+from .util import AtlasException, AtlasBaseClient, batch_dependent_entities, PurviewLimitation, PurviewOnly, _handle_response
+from .collections.purview import PurviewCollectionsClient
 from .glossary import _CrossPlatformTerm, GlossaryClient, PurviewGlossaryClient
-from .typedef import BaseTypeDef
+from .discovery.purview import PurviewDiscoveryClient
+from .typedef import BaseTypeDef, TypeCategory
 from .msgraph import MsGraphClient
 from .entity import AtlasClassification, AtlasEntity
 from ..auth.base import AtlasAuthBase
-import json
-from json.decoder import JSONDecodeError
 import logging
 import re
 import requests
@@ -32,39 +32,34 @@ class AtlasClient(AtlasBaseClient):
         The method of authentication.
     :type authentication:
         :class:`~pyapacheatlas.auth.base.AtlasAuthBase`
+    
+    Kwargs:
+        :param requests_*: 
+            Kwargs to pass to the underlying `requests` package method call.
+            For example passing `requests_verify = False` will supply `verify=False`
+            to any API call.
     """
 
-    def __init__(self, endpoint_url, authentication=None):
-        super().__init__()
+    def __init__(self, endpoint_url, authentication=None, **kwargs):
         self.authentication = authentication
         self.endpoint_url = endpoint_url
-        self.glossary = GlossaryClient(endpoint_url, authentication)
         self.is_purview = False
         self._purview_url_pattern = r"https:\/\/[a-z0-9-]*?\.(catalog\.purview.azure.com)"
         if re.match(self._purview_url_pattern, self.endpoint_url):
             self.is_purview = True
+        # If requests_verify=False is provided, it will result in
+        # storing verify:False in the _requests_args
+        if "requests_args" not in kwargs:
+            requests_args = AtlasClient._parse_requests_args(**kwargs)
+        else:
+            requests_args = kwargs.pop("requests_args")
+        
+        if "glossary" not in kwargs:
+            self.glossary = GlossaryClient(endpoint_url, authentication, requests_args=requests_args)
+        else:
+            self.glossary = kwargs["glossary"]
 
-    def _handle_response(self, resp):
-        """
-        Safely handle an Atlas Response and return the results if valid.
-
-        :param Response resp: The response from the request method.
-        :return: A dict containing the results.
-        :rtype: dict
-        """
-
-        try:
-            results = json.loads(resp.text)
-            resp.raise_for_status()
-        except JSONDecodeError:
-            raise ValueError("Error in parsing: {}".format(resp.text))
-        except requests.RequestException as e:
-            if "errorCode" in results:
-                raise AtlasException(resp.text)
-            else:
-                raise requests.RequestException(resp.text)
-
-        return results
+        super().__init__(requests_args = requests_args)
 
     def delete_entity(self, guid):
         """
@@ -88,10 +83,65 @@ class AtlasClient(AtlasBaseClient):
             "/entity/bulk?guid={}".format(guid_str)
         deleteEntity = requests.delete(
             atlas_endpoint,
-            headers=self.authentication.get_authentication_headers())
+            headers=self.authentication.get_authentication_headers(),
+            **self._requests_args
+            )
 
-        results = self._handle_response(deleteEntity)
+        results = _handle_response(deleteEntity)
 
+        return results
+
+    def delete_businessMetadata(self, guid, businessMetadata, force_update=True):
+        """
+        Delete one or many business attributes based on the guid. Provide a
+        businessMetadata dictionary that has a key for the businessmetadata
+        type def name and the value is a dictionary with keys of each
+        attribute you want to remove. The values inside the nested dict
+        should be an empty string ('').
+
+        If I have a business metadata typedef of 'operations`, with attributes
+        'expenseCode' and 'criticality' and I want to delete criticality, my
+        businessMetadata might be:
+        ```
+        {
+            'operations': {
+                'criticality': ''
+          }
+        }
+        ```
+
+        :param str guid:
+            The guid for the entity that you want to remove business metadata.
+        :param dict(str, dict) businessMetadata:
+            The business metadata you want to delete with key of the
+            businessMetadata type def and value of a dictionary with
+            keys for each attribute you want removed and value is an empty
+            string.
+        :param bool force_update:
+            Defaults to True.
+        :return:
+            A dictionary indicating success. Failure will raise an AtlasException.
+        :rtype: dict
+        """
+        results = None
+
+        atlas_endpoint = self.endpoint_url + \
+            f"/entity/guid/{guid}/businessmetadata"
+        deleteBizMeta = requests.delete(
+            atlas_endpoint,
+            headers=self.authentication.get_authentication_headers(),
+            params={"isOverwrite":force_update},
+            json=businessMetadata,
+            **self._requests_args
+            )
+
+        try:
+            deleteBizMeta.raise_for_status()
+        except requests.RequestException:
+            raise Exception(deleteBizMeta.text)
+
+        results = {
+            "message": f"Successfully deleted businessMetadata on entity with guid {guid}"}
         return results
 
     def delete_relationship(self, guid):
@@ -112,7 +162,9 @@ class AtlasClient(AtlasBaseClient):
             f"/relationship/guid/{guid}"
         deleteType = requests.delete(
             atlas_endpoint,
-            headers=self.authentication.get_authentication_headers())
+            headers=self.authentication.get_authentication_headers(),
+            **self._requests_args
+            )
 
         try:
             deleteType.raise_for_status()
@@ -138,7 +190,9 @@ class AtlasClient(AtlasBaseClient):
             f"/types/typedef/name/{name}"
         deleteType = requests.delete(
             atlas_endpoint,
-            headers=self.authentication.get_authentication_headers())
+            headers=self.authentication.get_authentication_headers(),
+            **self._requests_args
+            )
 
         try:
             deleteType.raise_for_status()
@@ -197,7 +251,9 @@ class AtlasClient(AtlasBaseClient):
         deleteType = requests.delete(
             atlas_endpoint,
             json=payload,
-            headers=self.authentication.get_authentication_headers())
+            headers=self.authentication.get_authentication_headers(),
+            **self._requests_args
+            )
 
         try:
             deleteType.raise_for_status()
@@ -271,10 +327,11 @@ class AtlasClient(AtlasBaseClient):
         getEntity = requests.get(
             atlas_endpoint,
             params=parameters,
-            headers=self.authentication.get_authentication_headers()
+            headers=self.authentication.get_authentication_headers(),
+            **self._requests_args
         )
 
-        results = self._handle_response(getEntity)
+        results = _handle_response(getEntity)
 
         return results
 
@@ -307,10 +364,11 @@ class AtlasClient(AtlasBaseClient):
         getEntity = requests.get(
             atlas_endpoint,
             params=parameters,
-            headers=self.authentication.get_authentication_headers()
+            headers=self.authentication.get_authentication_headers(),
+            **self._requests_args
         )
 
-        results = self._handle_response(getEntity)
+        results = _handle_response(getEntity)
 
         return results
 
@@ -345,7 +403,8 @@ class AtlasClient(AtlasBaseClient):
                 atlas_endpoint,
                 json=attribute_value,
                 params={"name": attribute_name},
-                headers=self.authentication.get_authentication_headers()
+                headers=self.authentication.get_authentication_headers(),
+                **self._requests_args
             )
         # TODO: Multiple attributes could be supported for guid by looking up
         # the qualified name and type and then re-running the command with
@@ -373,13 +432,14 @@ class AtlasClient(AtlasBaseClient):
                 atlas_endpoint,
                 json=entityInfo,
                 params={"attr:qualifiedName": qualifiedName},
-                headers=self.authentication.get_authentication_headers()
+                headers=self.authentication.get_authentication_headers(),
+                **self._requests_args
             )
         else:
             raise ValueError(
                 "The provided combination of arguments is not supported. Either provide a guid or type name and qualified name")
 
-        results = self._handle_response(putEntity)
+        results = _handle_response(putEntity)
 
         return results
 
@@ -398,9 +458,10 @@ class AtlasClient(AtlasBaseClient):
             f"/entity/guid/{guid}/classification/{classificationName}"
         getClassification = requests.get(
             atlas_endpoint,
-            headers=self.authentication.get_authentication_headers()
+            headers=self.authentication.get_authentication_headers(),
+            **self._requests_args
         )
-        results = self._handle_response(getClassification)
+        results = _handle_response(getClassification)
         return results
 
     def get_entity_classifications(self, guid):
@@ -419,10 +480,11 @@ class AtlasClient(AtlasBaseClient):
 
         getClassification = requests.get(
             atlas_endpoint,
-            headers=self.authentication.get_authentication_headers()
+            headers=self.authentication.get_authentication_headers(),
+            **self._requests_args
         )
 
-        results = self._handle_response(getClassification)
+        results = _handle_response(getClassification)
 
         return results
 
@@ -448,10 +510,11 @@ class AtlasClient(AtlasBaseClient):
         getEntity = requests.get(
             atlas_endpoint,
             params=parameters,
-            headers=self.authentication.get_authentication_headers()
+            headers=self.authentication.get_authentication_headers(),
+            **self._requests_args
         )
 
-        results = self._handle_response(getEntity)
+        results = _handle_response(getEntity)
 
         return results
 
@@ -470,10 +533,11 @@ class AtlasClient(AtlasBaseClient):
 
         getResponse = requests.get(
             atlas_endpoint,
-            headers=self.authentication.get_authentication_headers()
+            headers=self.authentication.get_authentication_headers(),
+            **self._requests_args
         )
 
-        results = self._handle_response(getResponse)
+        results = _handle_response(getResponse)
 
         return results
 
@@ -492,10 +556,11 @@ class AtlasClient(AtlasBaseClient):
 
         getTypeDefs = requests.get(
             atlas_endpoint,
-            headers=self.authentication.get_authentication_headers()
+            headers=self.authentication.get_authentication_headers(),
+            **self._requests_args
         )
 
-        results = self._handle_response(getTypeDefs)
+        results = _handle_response(getTypeDefs)
 
         return results
 
@@ -541,10 +606,11 @@ class AtlasClient(AtlasBaseClient):
 
         getTypeDef = requests.get(
             atlas_endpoint,
-            headers=self.authentication.get_authentication_headers()
+            headers=self.authentication.get_authentication_headers(),
+            **self._requests_args
         )
 
-        results = self._handle_response(getTypeDef)
+        results = _handle_response(getTypeDef)
 
         return results
 
@@ -739,13 +805,17 @@ class AtlasClient(AtlasBaseClient):
         atlas_endpoint = self.endpoint_url + "/types/typedefs/headers"
         getHeaders = requests.get(
             atlas_endpoint,
-            headers=self.authentication.get_authentication_headers()
+            headers=self.authentication.get_authentication_headers(),
+            **self._requests_args
         )
-        results = self._handle_response(getHeaders)
+        results = _handle_response(getHeaders)
 
         output = dict()
         for typedef in results:
-            active_category = typedef["category"].lower()+"Defs"
+            if typedef["category"].lower() == TypeCategory.BUSINESSMETADATA.value.lower():
+                active_category = "businessMetadataDefs"
+            else:
+                active_category = typedef["category"].lower()+"Defs"
             if active_category not in output:
                 output[active_category] = []
 
@@ -795,7 +865,8 @@ class AtlasClient(AtlasBaseClient):
         postBulkClassifications = requests.post(
             atlas_endpoint,
             json=payload,
-            headers=self.authentication.get_authentication_headers()
+            headers=self.authentication.get_authentication_headers(),
+            **self._requests_args
         )
 
         try:
@@ -826,7 +897,8 @@ class AtlasClient(AtlasBaseClient):
         postAddMultiClassifications = requests.post(
             atlas_endpoint,
             json=classifications,
-            headers=self.authentication.get_authentication_headers()
+            headers=self.authentication.get_authentication_headers(),
+            **self._requests_args
         )
 
         try:
@@ -855,7 +927,8 @@ class AtlasClient(AtlasBaseClient):
         putUpdateMultiClassifications = requests.put(
             atlas_endpoint,
             json=classifications,
-            headers=self.authentication.get_authentication_headers()
+            headers=self.authentication.get_authentication_headers(),
+            **self._requests_args
         )
 
         try:
@@ -965,7 +1038,8 @@ class AtlasClient(AtlasBaseClient):
 
         deleteEntityClassification = requests.delete(
             atlas_endpoint,
-            headers=self.authentication.get_authentication_headers()
+            headers=self.authentication.get_authentication_headers(),
+            **self._requests_args
         )
 
         try:
@@ -1091,9 +1165,10 @@ class AtlasClient(AtlasBaseClient):
             # This is just a plain push of new entities
             upload_typedefs_results = requests.post(
                 atlas_endpoint, json=payload,
-                headers=self.authentication.get_authentication_headers()
+                headers=self.authentication.get_authentication_headers(),
+                **self._requests_args
             )
-            results = self._handle_response(upload_typedefs_results)
+            results = _handle_response(upload_typedefs_results)
         else:
             # Look up all entities by their header
             types_from_client = self._get_typedefs_header()
@@ -1112,17 +1187,23 @@ class AtlasClient(AtlasBaseClient):
                     else:
                         new_types[cat].append(t)
 
-            upload_new = requests.post(
-                atlas_endpoint, json=new_types,
-                headers=self.authentication.get_authentication_headers()
-            )
-            results_new = self._handle_response(upload_new)
+            results_new = {}
+            if new_types and sum([len(defs) for defs in new_types.values()]) > 0:
+                upload_new = requests.post(
+                    atlas_endpoint, json=new_types,
+                    headers=self.authentication.get_authentication_headers(),
+                    **self._requests_args
+                )
+                results_new = _handle_response(upload_new)
 
-            upload_exist = requests.put(
-                atlas_endpoint, json=existing_types,
-                headers=self.authentication.get_authentication_headers()
-            )
-            results_exist = self._handle_response(upload_exist)
+            results_exist = {}
+            if existing_types and sum([len(defs) for defs in existing_types.values()]) > 0:
+                upload_exist = requests.put(
+                    atlas_endpoint, json=existing_types,
+                    headers=self.authentication.get_authentication_headers(),
+                    **self._requests_args
+                )
+                results_exist = _handle_response(upload_exist)
 
             # Merge the results
             results = results_new
@@ -1203,19 +1284,21 @@ class AtlasClient(AtlasBaseClient):
                 postBulkEntities = requests.post(
                     atlas_endpoint,
                     json=batch,
-                    headers=self.authentication.get_authentication_headers()
+                    headers=self.authentication.get_authentication_headers(),
+                    **self._requests_args
                 )
-                temp_results = self._handle_response(postBulkEntities)
+                temp_results = _handle_response(postBulkEntities)
                 results.append(temp_results)
 
         else:
             postBulkEntities = requests.post(
                 atlas_endpoint,
                 json=payload,
-                headers=self.authentication.get_authentication_headers()
+                headers=self.authentication.get_authentication_headers(),
+                **self._requests_args
             )
 
-            results = self._handle_response(postBulkEntities)
+            results = _handle_response(postBulkEntities)
 
         return results
 
@@ -1247,13 +1330,15 @@ class AtlasClient(AtlasBaseClient):
         relationshipResp = requests.post(
             atlas_endpoint,
             json=relationship,
-            headers=self.authentication.get_authentication_headers()
+            headers=self.authentication.get_authentication_headers(),
+            **self._requests_args
         )
 
-        results = self._handle_response(relationshipResp)
+        results = _handle_response(relationshipResp)
 
         return results
 
+    # TODO: Remove at 1.0.0 release
     def _search_generator(self, search_params, starting_offset=0):
         """
         Generator to page through the search query results.
@@ -1265,9 +1350,10 @@ class AtlasClient(AtlasBaseClient):
             postSearchResults = requests.post(
                 atlas_endpoint,
                 json=search_params,
-                headers=self.authentication.get_authentication_headers()
+                headers=self.authentication.get_authentication_headers(),
+                **self._requests_args
             )
-            results = self._handle_response(postSearchResults)
+            results = _handle_response(postSearchResults)
             return_values = results["value"]
             return_count = len(return_values)
 
@@ -1300,6 +1386,9 @@ class AtlasClient(AtlasBaseClient):
         :return: The results of your search as a generator.
         :rtype: Iterator(dict)
         """
+        # TODO: Remove at 1.0.0 release
+        warnings.warn(
+            "PurviewClient.search_entities is being deprecated. Please use PurviewClient.discovery.search_entities instead.")
 
         if limit > 1000 or limit < 1:
             raise ValueError(
@@ -1352,12 +1441,12 @@ class AtlasClient(AtlasBaseClient):
             atlas_endpoint,
             params={"depth": depth, "width": width, "direction": direction,
                     "includeParent": includeParent, "getDerivedLineage": getDerivedLineage},
-            headers=self.authentication.get_authentication_headers()
+            headers=self.authentication.get_authentication_headers(),
+            **self._requests_args
         )
-        results = self._handle_response(getLineageRequest)
+        results = _handle_response(getLineageRequest)
         return results
 
-    @PurviewLimitation
     def delete_entity_labels(self, labels, guid=None, typeName=None, qualifiedName=None):
         """
         Delete the given labels for one entity. Provide a list of strings that
@@ -1415,7 +1504,6 @@ class AtlasClient(AtlasBaseClient):
         results = {"message": f"Successfully deleted labels for {action}"}
         return results
 
-    @PurviewLimitation
     def update_entity_labels(self, labels, guid=None, typeName=None, qualifiedName=None, force_update=False):
         """
         Update the given labels for one entity. Provide a list of strings that
@@ -1480,6 +1568,58 @@ class AtlasClient(AtlasBaseClient):
         results = {"message": f"Successfully {verb} labels for {action}"}
         return results
 
+    def update_businessMetadata(self, guid, businessMetadata, force_update=False):
+        """
+        Update the business metadata. Provide a businessMetadata dictionary
+        that has a key for the businessmetadata type def name and the value
+        is a dictionary with keys of each attribute you want to add/update.
+
+        If I have a business metadata typedef of 'operations`, with attributes
+        'expenseCode' and 'criticality', my businessMetadata might be:
+        ```
+        {
+            'operations': {
+                'expenseCode': '123',
+                'criticality': 'low'
+          }
+        }
+        ```
+        :param str guid:
+            The guid for the entity that you want to update business metadata.
+        :param dict(str, dict) businessMetadata:
+            The business metadata you want to update with key of the
+            businessMetadata type def and value of a dictionary with
+            keys for each attribute you want removed and value
+        :param bool force_update:
+            Defaults to False where you are only overwriting the business
+            attributes you specify in businessMetadata. Set to True to
+            overwrite all existing business metadata attributes with the value
+            you provided.
+        :return:
+            A dict containing a message indicating success. Otherwise
+            it will raise an AtlasException.
+        :rtype: dict(str, str)
+        """
+        atlas_endpoint= self.endpoint_url + f"/entity/guid/{guid}/businessmetadata"
+        updateBizMeta = requests.post(
+            atlas_endpoint,
+            params={"isOverwrite":force_update},
+            json=businessMetadata,
+            headers=self.authentication.get_authentication_headers(),
+            **self._requests_args
+        )
+
+        # Can't use _handle_response since it expects json returned
+        try:
+            updateBizMeta.raise_for_status()
+        except requests.RequestException as e:
+            if isinstance(updateBizMeta, dict) and "errorCode" in updateBizMeta:
+                raise AtlasException(updateBizMeta.text)
+            else:
+                raise requests.RequestException(updateBizMeta.text)
+
+        return {"message": f"Successfully updated business metadata for {guid}"}
+
 
 class PurviewClient(AtlasClient):
     """
@@ -1487,15 +1627,24 @@ class PurviewClient(AtlasClient):
     service. Simplifies the requirements for knowing the endpoint url and
     requires only the Purview account name.
 
+    See also:
+    https://docs.microsoft.com/en-us/rest/api/purview/
+
     :param str account_name:
         Your Purview account name.
     :param authentication:
         The method of authentication.
     :type authentication:
         :class:`~pyapacheatlas.auth.base.AtlasAuthBase`
+    
+    Kwargs:
+        :param requests_*: 
+            Kwargs to pass to the underlying `requests` package method call.
+            For example passing `requests_verify = False` will supply `verify=False`
+            to any API call.
     """
 
-    def __init__(self, account_name, authentication=None):
+    def __init__(self, account_name, authentication=None, **kwargs):
         endpoint_url = f"https://{account_name.lower()}.catalog.purview.azure.com/api/atlas/v2"
         if authentication and not isinstance(authentication, AtlasAuthBase):
             # Assuming this is Azure Identity related
@@ -1504,15 +1653,24 @@ class PurviewClient(AtlasClient):
             else:
                 raise Exception(
                     "You probably need to install azure-identity to use this authentication method.")
-        super().__init__(endpoint_url, authentication)
+        if "requests_args" in kwargs:
+            requests_args = kwargs.pop("requests_args")
+        else:
+            requests_args = AtlasBaseClient._parse_requests_args(**kwargs)
 
-        self.glossary = PurviewGlossaryClient(endpoint_url, authentication)
-        self.msgraph = MsGraphClient(authentication)
+        glossary = PurviewGlossaryClient(endpoint_url, authentication, requests_args = requests_args)
+        self.collections = PurviewCollectionsClient(f"https://{account_name.lower()}.purview.azure.com/", authentication, requests_args = requests_args)
+        self.msgraph = MsGraphClient(authentication, requests_args = requests_args)
+        self.discovery = PurviewDiscoveryClient(f"https://{account_name.lower()}.purview.azure.com/catalog/api", authentication, requests_args = requests_args)
+        super().__init__(endpoint_url, authentication, glossary = glossary, requests_args = requests_args, **kwargs)
 
     @PurviewOnly
     def get_entity_next_lineage(self, guid, direction, getDerivedLineage=False, offset=0, limit=-1):
         """
         Returns immediate next level lineage info about entity with pagination
+
+        See also:
+        https://docs.microsoft.com/en-us/rest/api/purview/catalogdataplane/lineage
 
         :param str guid: The guid of the entity for which you want to
             retrieve lineage.
@@ -1538,9 +1696,10 @@ class PurviewClient(AtlasClient):
             atlas_endpoint,
             params={"direction": direction, "getDerivedLineage": getDerivedLineage,
                     "offset": offset, "limit": limit},
-            headers=self.authentication.get_authentication_headers()
+            headers=self.authentication.get_authentication_headers(),
+            **self._requests_args
         )
-        results = self._handle_response(getLineageRequest)
+        results = _handle_response(getLineageRequest)
         return results
 
     def import_terms(self, csv_path, glossary_name="Glossary", glossary_guid=None):
